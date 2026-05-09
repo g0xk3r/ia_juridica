@@ -1,24 +1,22 @@
 import os
+import time
+import json
 from typing import List
+import numpy as np
+import faiss
+from PyPDF2 import PdfReader
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 import uvicorn
+from dotenv import load_dotenv
 
-# LangChain imports
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+# Cargar las variables secretas de tu archivo .env
+load_dotenv()
+client = OpenAI()
 
-# Configurar la llave de OpenAI (Asegúrate de poner la tuya aquí o en el .env)
-os.environ["OPENAI_API_KEY"] = "sk-TU-LLAVE-AQUI"
+app = FastAPI(title="API Asistente Jurídico (Nativo y Permanente)")
 
-app = FastAPI(title="API de Asistente Jurídico (RAG)")
-
-# Configurar CORS para que el Front-end de Alan pueda conectarse sin errores
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,88 +25,160 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Variable global para guardar nuestra base de datos vectorial en memoria
-vector_store = None
+# Nombres de los archivos donde guardaremos la base de datos en tu computadora
+INDEX_FILE = "base_legal.faiss"
+DOCS_FILE = "documentos.json"
+
+# Cargar la base de datos automáticamente si ya existe en el disco duro
+if os.path.exists(INDEX_FILE) and os.path.exists(DOCS_FILE):
+    faiss_index = faiss.read_index(INDEX_FILE)
+    with open(DOCS_FILE, "r", encoding="utf-8") as f:
+        documentos_almacenados = json.load(f)
+    print("--- ¡Bases de datos cargadas exitosamente desde el disco! ---")
+else:
+    faiss_index = None
+    documentos_almacenados = []
+
+def obtener_embedding(texto: str):
+    """Llama a la API de OpenAI para convertir texto en números"""
+    respuesta = client.embeddings.create(
+        input=[texto], 
+        model="text-embedding-3-small" # Modelo optimizado y baratísimo
+    )
+    return respuesta.data[0].embedding
 
 @app.post("/cargar_documentos/")
-async def cargar_documentos(archivos: List[UploadFile] = File(...)):
-    """
-    Endpoint para subir uno o varios PDFs, procesarlos y crear la base vectorial.
-    """
-    global vector_store
-    textos_completos = []
+async def cargar_documentos(archivo: UploadFile = File(...)):
+    global faiss_index, documentos_almacenados
+    
+    todos_los_chunks = []
+    embeddings_lista = []
 
-    # 1. Leer y procesar cada archivo subido
-    for archivo in archivos:
-        # Guardar el PDF temporalmente
-        file_path = f"temp_{archivo.filename}"
-        with open(file_path, "wb") as f:
-            f.write(await archivo.read())
-        
-        # Extraer el texto del PDF
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-        
-        # Añadir el nombre del archivo a los metadatos para saber la fuente
-        for doc in docs:
-            doc.metadata["fuente"] = archivo.filename
+    # Guardar el PDF temporalmente
+    temp_path = f"temp_{archivo.filename}"
+    with open(temp_path, "wb") as f:
+        f.write(await archivo.read())
+    
+    # Leer el PDF manualmente con PyPDF2
+    reader = PdfReader(temp_path)
+    texto_completo = ""
+    for page in reader.pages:
+        texto_extraido = page.extract_text()
+        if texto_extraido:
+            texto_completo += texto_extraido + " "
+    
+    os.remove(temp_path)
+
+    # Dividir el texto en "Chunks" de ~1000 caracteres
+    chunk_size = 1000
+    for i in range(0, len(texto_completo), chunk_size):
+        pedazo = texto_completo[i:i+chunk_size]
+        if len(pedazo) > 50:
+            todos_los_chunks.append({
+                "texto": pedazo, 
+                "fuente": archivo.filename
+            })
             
-        textos_completos.extend(docs)
-        os.remove(file_path) # Borrar el archivo temporal
+    print(f"\n--- Iniciando procesamiento de {len(todos_los_chunks)} fragmentos ---")
 
-    # 2. Dividir los textos en pedazos pequeños (Chunks)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = text_splitter.split_documents(textos_completos)
+    # PROCESAMIENTO EN LOTES PARA NO SATURAR LA API
+    tamano_lote = 20
+    for i in range(0, len(todos_los_chunks), tamano_lote):
+        lote = todos_los_chunks[i:i + tamano_lote]
+        textos_lote = [chunk["texto"] for chunk in lote]
+        
+        try:
+            # Mandamos de 20 en 20 de un solo golpe
+            respuesta = client.embeddings.create(
+                input=textos_lote,
+                model="text-embedding-3-small"
+            )
+            
+            # Guardamos los resultados y aplicamos el "modo apantallar"
+            for j, data in enumerate(respuesta.data):
+                emb = data.embedding
+                chunk_actual = lote[j]
+                
+                embeddings_lista.append(emb)
+                documentos_almacenados.append(chunk_actual)
+                
+                # Impresión en terminal para demostrar la vectorización
+                print(f"\n--- Texto extraído: {chunk_actual['texto'][:50]}... ---")
+                print(f"--- Vector matemático: {emb[:5]}... (y 1531 dimensiones más) ---")
+                
+            print(f"\n>>> Procesados {min(i + tamano_lote, len(todos_los_chunks))} de {len(todos_los_chunks)}...")
+            
+            # Descanso de 2 segundos para no saturar OpenAI
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"\n¡Error de OpenAI en el lote! Detalle: {e}")
+            return {"error": f"Error al procesar: {str(e)}"}
 
-    # 3. Crear los Embeddings y guardarlos en FAISS (La base vectorial)
-    embeddings = OpenAIEmbeddings()
-    vector_store = FAISS.from_documents(chunks, embeddings)
+    # Construir la base de datos vectorial de FAISS
+    dimension = len(embeddings_lista[0])
+    if faiss_index is None:
+        faiss_index = faiss.IndexFlatL2(dimension)
+    
+    matriz_vectores = np.array(embeddings_lista).astype('float32')
+    faiss_index.add(matriz_vectores)
 
-    return {"mensaje": f"Se procesaron {len(archivos)} archivos correctamente y la base vectorial está lista."}
+    # GUARDAR PERMANENTEMENTE EN EL DISCO DURO
+    faiss.write_index(faiss_index, INDEX_FILE)
+    with open(DOCS_FILE, "w", encoding="utf-8") as f:
+        json.dump(documentos_almacenados, f, ensure_ascii=False, indent=4)
+
+    print("\n--- ¡BASE VECTORIAL CREADA Y GUARDADA EN DISCO CON ÉXITO! ---")
+    return {"mensaje": f"Se procesó el archivo '{archivo.filename}' y se guardó permanentemente."}
 
 
 @app.post("/consultar/")
 async def consultar(pregunta: str = Form(...)):
-    """
-    Endpoint donde se hace la pregunta. Busca en la base vectorial y genera la respuesta.
-    """
-    global vector_store
-    if vector_store is None:
+    global faiss_index, documentos_almacenados
+    
+    if faiss_index is None:
         return {"error": "Primero debes cargar documentos usando /cargar_documentos/"}
 
-    # 1. Configurar el LLM (ChatGPT)
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+    # 1. Convertir la pregunta a vector
+    vector_pregunta = obtener_embedding(pregunta)
+    vector_np = np.array([vector_pregunta]).astype('float32')
 
-    # 2. Crear el Prompt (Las instrucciones estrictas para la IA)
-    system_prompt = (
-        "Eres un asistente legal experto. Usa los siguientes fragmentos de contexto "
-        "recuperado para responder a la pregunta. Si no sabes la respuesta, di que "
-        "no lo sabes, no inventes información.\n\n"
-        "{context}"
-    )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ])
+    # 2. Buscar en FAISS los 3 fragmentos más parecidos a la pregunta
+    k = 3
+    distancias, indices = faiss_index.search(vector_np, k)
 
-    # 3. Conectar FAISS con el LLM
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3}) # Traer los 3 mejores fragmentos
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-
-    # 4. Ejecutar la consulta
-    respuesta = rag_chain.invoke({"input": pregunta})
-
-    # 5. Extraer las fuentes de donde sacó la información
+    contexto_texto = ""
     fuentes_usadas = []
-    for doc in respuesta["context"]:
-        fuente = doc.metadata.get("fuente", "Desconocida")
-        if fuente not in fuentes_usadas:
-            fuentes_usadas.append(fuente)
+
+    # 3. Armar el contexto con lo que encontró FAISS
+    for idx in indices[0]:
+        if idx != -1 and idx < len(documentos_almacenados):
+            doc = documentos_almacenados[idx]
+            contexto_texto += f"[{doc['fuente']}]: {doc['texto']}\n\n"
+            if doc['fuente'] not in fuentes_usadas:
+                fuentes_usadas.append(doc['fuente'])
+
+    # 4. Mandar todo a ChatGPT con REGLAS ESTRICTAS ANTI-ALUCINACIÓN
+    prompt_final = f"""Eres un asistente legal experto. 
+    Tu regla de ORO es responder ÚNICAMENTE basándote en el contexto legal proporcionado abajo.
+    Si la respuesta a la pregunta NO se encuentra en el contexto, debes decir EXACTAMENTE: "No tengo suficiente información en los documentos proporcionados para responder a esta pregunta."
+    Bajo NINGUNA circunstancia debes inventar información, suponer o usar conocimiento externo.
+    Al final de tu respuesta, menciona obligatoriamente el nombre del documento del cual extrajiste la información.
+    
+    CONTEXTO RECUPERADO:
+    {contexto_texto}
+    
+    PREGUNTA DEL USUARIO: {pregunta}"""
+
+    respuesta = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt_final}],
+        temperature=0.0 # Temperatura en 0 para evitar que se ponga "creativo"
+    )
 
     return {
         "pregunta": pregunta,
-        "respuesta_ia": respuesta["answer"],
+        "respuesta_ia": respuesta.choices[0].message.content,
         "fuentes_consultadas": fuentes_usadas
     }
 
