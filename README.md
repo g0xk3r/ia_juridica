@@ -1,3 +1,9 @@
+Servidor local
+
+http://127.0.0.1:8000/docs
+
+----------------------------------------------------------------------------------------------------
+
 Para correrlo en terminal de windows
 
 python -m venv venv
